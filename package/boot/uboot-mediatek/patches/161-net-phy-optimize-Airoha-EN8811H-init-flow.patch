@@ -1,0 +1,301 @@
+From 8336d56c03525393c89997d2f4487689d4606095 Mon Sep 17 00:00:00 2001
+From: "Lucien.Jheng" <lucienzx159@gmail.com>
+Date: Sun, 8 Jun 2025 22:59:57 +0800
+Subject: [PATCH] net: phy: optimize Airoha EN8811H init flow
+
+---
+ .../drivers/net/phy/air_en8811h.c             | 207 ++++++------------
+ .../drivers/net/phy/air_en8811h.h             |   9 +-
+ 2 files changed, 74 insertions(+), 142 deletions(-)
+
+diff --git a/drivers/net/phy/air_en8811h.c b/drivers/net/phy/air_en8811h.c
+index 31f310aca..8d6ff592b 100644
+--- a/drivers/net/phy/air_en8811h.c
++++ b/drivers/net/phy/air_en8811h.c
+@@ -486,8 +486,15 @@ static int en8811h_load_firmware(struct phy_device *phydev)
+
+ static int en8811h_config(struct phy_device *phydev)
+ {
+-    int ret = 0;
++    int ret = 0, reg_value, retry;
+     int pid1 = 0, pid2 = 0;
++    u32 pbus_value;
++    ofnode node = phy_get_ofnode(phydev);
++
++    eth_phy_reset(phydev->dev, 1);
++    mdelay(10);
++    eth_phy_reset(phydev->dev, 0);
++    mdelay(1);
+
+     ret = air_pbus_reg_write(phydev, 0xcf928 , 0x0);
+     if (ret < 0)
+@@ -500,39 +507,12 @@ static int en8811h_config(struct phy_device *phydev)
+         return -ENODEV;
+     }
+
+-    return 0;
+-}
+-
+-static int en8811h_get_autonego(struct phy_device *phydev, int *an)
+-{
+-    int reg;
+-    reg = phy_read(phydev, MDIO_DEVAD_NONE, MII_BMCR);
+-    if (reg < 0)
+-        return -EINVAL;
+-    if (reg & BMCR_ANENABLE)
+-        *an = AUTONEG_ENABLE;
+-    else
+-        *an = AUTONEG_DISABLE;
+-    return 0;
+-}
+-
+-static int en8811h_startup(struct phy_device *phydev)
+-{
+-    ofnode node = phy_get_ofnode(phydev);
+-    int ret = 0, lpagb = 0, lpa = 0, common_adv_gb = 0, common_adv = 0, advgb = 0, adv = 0, reg = 0, an = AUTONEG_DISABLE, bmcr = 0, reg_value;
+-    int old_link = phydev->link;
+-    u32 pbus_value = 0, retry;
+-
+-    eth_phy_reset(phydev->dev, 1);
+-    mdelay(10);
+-    eth_phy_reset(phydev->dev, 0);
+-    mdelay(1);
+-
+     ret = en8811h_load_firmware(phydev);
+     if (ret) {
+         printf("EN8811H load firmware fail.\n");
+         return ret;
+     }
++
+     retry = MAX_RETRY;
+     do {
+         mdelay(300);
+@@ -541,15 +521,17 @@ static int en8811h_startup(struct phy_device *phydev)
+             printf("EN8811H PHY ready!\n");
+             break;
+         }
++
+         retry--;
++        if (retry == 0) {
++            printf("EN8811H PHY is not ready. (MD32 FW Status reg: 0x%x)\n", reg_value);
++            pbus_value = air_buckpbus_reg_read(phydev, 0x3b3c);
++            printf("Check MD32 FW Version(0x3b3c) : %08x\n", pbus_value);
++            printf("EN8811H initialize fail!\n");
++            return 0;
++        }
+     } while (retry);
+-    if (0 == retry) {
+-        printf("EN8811H PHY is not ready. (MD32 FW Status reg: 0x%x)\n", reg_value);
+-        pbus_value = air_buckpbus_reg_read(phydev, 0x3b3c);
+-        printf("Check MD32 FW Version(0x3b3c) : %08x\n", pbus_value);
+-        printf("EN8811H initialize fail!\n");
+-        return 0;
+-    }
++
+     /* Mode selection*/
+     printf("EN8811H Mode 1 !\n");
+     ret = air_mii_cl45_write(phydev, 0x1e, 0x800c, 0x0);
+@@ -577,125 +559,68 @@ static int en8811h_startup(struct phy_device *phydev)
+         return ret;
+     pbus_value = air_buckpbus_reg_read(phydev, 0xca0f8);
+     printf("Tx, Rx Polarity(0xca0f8): %08x\n", pbus_value);
++
+     pbus_value = air_buckpbus_reg_read(phydev, 0x3b3c);
+     printf("MD32 FW Version(0x3b3c) : %08x\n", pbus_value);
++
+ #if defined(AIR_LED_SUPPORT)
+     ret = en8811h_led_init(phydev);
+     if (ret < 0) {
+         printf("en8811h_led_init fail\n");
+     }
+ #endif
+-    printf("EN8811H initialize OK ! (%s)\n", EN8811H_DRIVER_VERSION);
+
+-    ret = genphy_update_link(phydev);
+-    if (ret)
+-    {
+-        printf("ret %d!\n", ret);
+-        return ret;
+-    }
++    printf("EN8811H initialize OK ! (%s)\n", EN8811H_DRIVER_VERSION);
+
+-    ret = genphy_parse_link(phydev);
+-    if (ret)
+-    {
+-        printf("ret %d!\n", ret);
+-        return ret;
+-    }
++    return 0;
++}
+
+-    if (old_link && phydev->link)
+-       return 0;
++static int en8811h_parse_status(struct phy_device *phydev)
++{
++	int ret = 0, reg_value;
++
++	phydev->duplex = DUPLEX_FULL;
++
++	reg_value = phy_read(phydev, MDIO_DEVAD_NONE, 0x1f);
++	if (reg_value < 0)
++		return reg_value;
++	printf("Page: 0x%x\n", reg_value);
++
++	ret = phy_write(phydev, MDIO_DEVAD_NONE, 0x1F, 0);
++	if (ret < 0)
++		return ret;
++	reg_value = phy_read(phydev, MDIO_DEVAD_NONE, AIR_AUX_CTRL_STATUS);
++	if (reg_value < 0)
++		return reg_value;
++
++	switch (reg_value & AIR_AUX_CTRL_STATUS_SPEED_MASK) {
++	case AIR_AUX_CTRL_STATUS_SPEED_2500:
++		phydev->speed = SPEED_2500;
++		break;
++	case AIR_AUX_CTRL_STATUS_SPEED_1000:
++		phydev->speed = SPEED_1000;
++		break;
++	case AIR_AUX_CTRL_STATUS_SPEED_100:
++		phydev->speed = SPEED_100;
++		break;
++	default:
++		printf("Auto-neg error, defaulting to 100M/FD\n");
++		phydev->speed = SPEED_100;
++		break;
++	}
++
++	return ret;
++}
+
+-    phydev->speed = SPEED_100;
+-    phydev->duplex = DUPLEX_FULL;
+-    phydev->pause = 0;
+-    phydev->asym_pause = 0;
++static int en8811h_startup(struct phy_device *phydev)
++{
++	int ret = 0;
+
+-    reg = phy_read(phydev, MDIO_DEVAD_NONE, MII_BMSR);
+-    if (reg < 0)
+-    {
+-        printf("MII_BMSR reg %d!\n", reg);
+-        return reg;
+-    }
+-    reg = phy_read(phydev, MDIO_DEVAD_NONE, MII_BMSR);
+-    if (reg < 0)
+-    {
+-        printf("MII_BMSR reg %d!\n", reg);
+-        return reg;
+-    }
+-    if(reg & BMSR_LSTATUS)
+-    {
+-        pbus_value = air_buckpbus_reg_read(phydev, 0x109D4);
+-        if (0x10 & pbus_value) {
+-            phydev->speed = SPEED_2500;
+-            phydev->duplex = DUPLEX_FULL;
+-        }
+-        else
+-        {
+-            ret = en8811h_get_autonego(phydev, &an);
+-            if ((AUTONEG_ENABLE == an) && (0 == ret))
+-            {
+-                printf("AN mode!\n");
+-                printf("SPEED 1000/100!\n");
+-                lpagb = phy_read(phydev, MDIO_DEVAD_NONE, MII_STAT1000);
+-                if (lpagb < 0 )
+-                    return lpagb;
+-                advgb = phy_read(phydev, MDIO_DEVAD_NONE, MII_CTRL1000);
+-                if (adv < 0 )
+-                    return adv;
+-                common_adv_gb = (lpagb & (advgb << 2));
+-
+-                lpa = phy_read(phydev, MDIO_DEVAD_NONE, MII_LPA);
+-                if (lpa < 0 )
+-                    return lpa;
+-                adv = phy_read(phydev, MDIO_DEVAD_NONE, MII_ADVERTISE);
+-                if (adv < 0 )
+-                    return adv;
+-                common_adv = (lpa & adv);
+-
+-                phydev->speed = SPEED_10;
+-                phydev->duplex = DUPLEX_HALF;
+-                if (common_adv_gb & (LPA_1000FULL | LPA_1000HALF))
+-                {
+-                    phydev->speed = SPEED_1000;
+-                    if (common_adv_gb & LPA_1000FULL)
+-
+-                        phydev->duplex = DUPLEX_FULL;
+-                }
+-                else if (common_adv & (LPA_100FULL | LPA_100HALF))
+-                {
+-                    phydev->speed = SPEED_100;
+-                    if (common_adv & LPA_100FULL)
+-                        phydev->duplex = DUPLEX_FULL;
+-                }
+-                else
+-                {
+-                    if (common_adv & LPA_10FULL)
+-                        phydev->duplex = DUPLEX_FULL;
+-                }
+-            }
+-            else
+-            {
+-                printf("Force mode!\n");
+-                bmcr = phy_read(phydev, MDIO_DEVAD_NONE, MII_BMCR);
+-
+-                if (bmcr < 0)
+-                    return bmcr;
+-
+-                if (bmcr & BMCR_FULLDPLX)
+-                    phydev->duplex = DUPLEX_FULL;
+-                else
+-                    phydev->duplex = DUPLEX_HALF;
+-
+-                if (bmcr & BMCR_SPEED1000)
+-                    phydev->speed = SPEED_1000;
+-                else if (bmcr & BMCR_SPEED100)
+-                    phydev->speed = SPEED_100;
+-                else
+-                    phydev->speed = SPEED_100;
+-            }
+-        }
+-    }
++	ret = genphy_update_link(phydev);
++	if (ret)
++		return ret;
+
+-    return ret;
++	return en8811h_parse_status(phydev);
+ }
+
+ #if AIR_UBOOT_REVISION > 0x202303
+diff --git a/drivers/net/phy/air_en8811h.h b/drivers/net/phy/air_en8811h.h
+index e1c7a3c7f..af9583abb 100644
+--- a/drivers/net/phy/air_en8811h.h
++++ b/drivers/net/phy/air_en8811h.h
+@@ -23,7 +23,7 @@
+ #define EN8811H_PHY_ID              ((EN8811H_PHY_ID1 << 16) | EN8811H_PHY_ID2)
+ #define EN8811H_SPEED_2500          0x03
+ #define EN8811H_PHY_READY           0x02
+-#define MAX_RETRY                   5
++#define MAX_RETRY                   25
+
+ #define EN8811H_MD32_DM_SIZE   0x4000
+ #define EN8811H_MD32_DSP_SIZE  0x20000
+@@ -116,6 +116,13 @@
+ #define INVALID_DATA                0xffff
+ #define PBUS_INVALID_DATA           0xffffffff
+
++ /* MII Registers */
++ #define AIR_AUX_CTRL_STATUS		0x1d
++ #define   AIR_AUX_CTRL_STATUS_SPEED_MASK	GENMASK(4, 2)
++ #define   AIR_AUX_CTRL_STATUS_SPEED_100		0x4
++ #define   AIR_AUX_CTRL_STATUS_SPEED_1000	0x8
++ #define   AIR_AUX_CTRL_STATUS_SPEED_2500	0xc
++
+ struct air_base_t_led_cfg_s {
+     u16 en;
+     u16 gpio;
+--
+2.34.1
+
